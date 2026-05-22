@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from scanner_core import scan_market
+import scanner_core
 
 app = FastAPI()
 
@@ -7,12 +7,16 @@ app = FastAPI()
 def root():
     return {
         "status": "online",
-        "service": "Lior Trading MCP"
+        "service": "Lior Trading MCP",
+        "available": dir(scanner_core)
     }
 
 @app.get("/scan")
 def scan():
-    results = scan_market()
     return {
-        "results": results
+        "message": "server online, scanner_core loaded",
+        "available_functions": [
+            name for name in dir(scanner_core)
+            if not name.startswith("_")
+        ]
     }
