@@ -1,0 +1,6 @@
+fastmcp>=2.0
+pandas>=2.0
+yfinance>=0.2.40
+ta>=0.11.0
+uvicorn>=0.30
+python-dotenv>=1.0
