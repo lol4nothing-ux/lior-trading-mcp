@@ -9,54 +9,30 @@ from ta.momentum import RSIIndicator
 
 
 DEFAULT_TICKERS = [
-    # Mega / AI / Semis
     "MSFT", "AAPL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "AMD", "INTC",
     "TSM", "MU", "SMCI", "ARM", "QCOM", "SNPS", "ANET", "DELL",
-
-    # Software / Cyber / Cloud
     "CRWD", "PANW", "FTNT", "DDOG", "ZS", "NET", "MDB", "CRM", "NOW", "ORCL",
     "PLTR", "SNOW", "EPAM",
-
-    # Data centers / Power / Electricity
     "VRT", "ETN", "VST", "CEG", "GEV", "NRG", "IREN", "BE", "CWEN", "NNE", "OKLO",
-
-    # Defense / Industrials / Space
     "KTOS", "LMT", "RTX", "LHX", "NOC", "AVAV", "BA", "HON", "RKLB", "ACHR",
     "RDW", "XAR", "ESLT",
-
-    # Crypto proxies / Bitcoin miners
     "MSTR", "IBIT", "CLSK", "MARA", "HUT", "HIVE", "CAN", "BMNR", "BTCS",
-
-    # Financials
     "JPM", "BAC", "GS", "MA", "V", "SOFI", "IBKR", "KRE",
-
-    # Energy / Materials / Commodities
     "OXY", "CVX", "XOM", "SLB", "BKR", "SU", "BNO", "MP", "GLD", "SLV",
-
-    # Health / Biotech
     "LLY", "UNH", "MRNA", "EXEL", "TMDX", "TEM", "ISRG", "SYK", "GRAL", "NTSK",
-
-    # Speculative / Quantum / Growth
     "QUBT", "RGTI", "QBTS", "IONQ", "NBIS", "CRWV", "ODD", "FIG", "SEDG",
-
-    # China / Other
     "BABA", "ZIM",
-
-    # ETFs
     "SPY", "QQQ", "QQQM", "RSP", "SOXX", "SMH", "XLK", "IGV", "CIBR", "HACK",
     "XLF", "XLE", "XLV", "XLI", "XLY", "XLC", "XLB", "XLU", "XLP", "XLRE",
     "ITB", "REMX", "NLR", "QTUM", "TAN", "MAGS",
 ]
-
 
 CORE_MARKET = [
     "^VIX", "BTC-USD", "ETH-USD", "GC=F", "SI=F",
     "RSP", "SPY", "^GSPC", "QQQM", "^NDX", "^DJI", "IWM"
 ]
 
-MACRO = [
-    "TIP", "DX-Y.NYB", "LQD", "HYG"
-]
+MACRO = ["TIP", "DX-Y.NYB", "LQD", "HYG"]
 
 SECTORS = [
     "XAR", "MAGS", "SOXX", "SMH", "CIBR", "HACK", "TAN",
@@ -136,6 +112,56 @@ def qqq_return_20d() -> Optional[float]:
     return float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
 
 
+def get_fundamentals(ticker: str) -> Dict[str, Any]:
+    try:
+        info = yf.Ticker(ticker).info or {}
+
+        revenue_growth = info.get("revenueGrowth")
+        forward_pe = info.get("forwardPE")
+        peg_like = None
+
+        if revenue_growth and revenue_growth > 0 and forward_pe:
+            peg_like = forward_pe / (revenue_growth * 100)
+
+        flags = []
+
+        if revenue_growth is not None and revenue_growth >= 0.20:
+            flags.append("High revenue growth")
+
+        if info.get("grossMargins") is not None and info.get("grossMargins") >= 0.50:
+            flags.append("High gross margin")
+
+        if info.get("operatingMargins") is not None and info.get("operatingMargins") >= 0.20:
+            flags.append("Strong operating margin")
+
+        if info.get("freeCashflow") is not None and info.get("freeCashflow") > 0:
+            flags.append("Positive free cash flow")
+
+        if peg_like is not None and peg_like <= 1.5:
+            flags.append("Reasonable growth valuation")
+
+        if info.get("shortPercentOfFloat") is not None and info.get("shortPercentOfFloat") >= 0.10:
+            flags.append("High short interest")
+
+        return {
+            "market_cap": info.get("marketCap"),
+            "trailing_pe": info.get("trailingPE"),
+            "forward_pe": forward_pe,
+            "peg_like": round(peg_like, 2) if peg_like is not None else None,
+            "price_to_sales": info.get("priceToSalesTrailing12Months"),
+            "revenue_growth": round(revenue_growth * 100, 2) if revenue_growth is not None else None,
+            "gross_margins": round(info.get("grossMargins") * 100, 2) if info.get("grossMargins") is not None else None,
+            "operating_margins": round(info.get("operatingMargins") * 100, 2) if info.get("operatingMargins") is not None else None,
+            "profit_margins": round(info.get("profitMargins") * 100, 2) if info.get("profitMargins") is not None else None,
+            "free_cashflow": info.get("freeCashflow"),
+            "analyst_target": info.get("targetMeanPrice"),
+            "short_float_pct": round(info.get("shortPercentOfFloat") * 100, 2) if info.get("shortPercentOfFloat") is not None else None,
+            "fundamental_flags": flags,
+        }
+    except Exception as e:
+        return {"fundamental_error": str(e)}
+
+
 def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
     ticker = ticker.upper().strip()
 
@@ -163,6 +189,7 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
     distance_from_ma50 = ((price / ma50) - 1) * 100
     distance_from_ma150 = ((price / ma150) - 1) * 100
 
+    fundamentals = get_fundamentals(ticker)
     setups: List[Setup] = []
 
     if price > ma150 and 45 <= rsi <= 68 and 0 < distance_to_breakout <= 5 and distance_from_ma50 <= 8:
@@ -170,6 +197,10 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         if rs_diff is not None and rs_diff > 0:
             score += 2
         if price > ma50:
+            score += 1
+        if "Reasonable growth valuation" in fundamentals.get("fundamental_flags", []):
+            score += 1
+        if "High revenue growth" in fundamentals.get("fundamental_flags", []):
             score += 1
 
         setups.append(
@@ -195,6 +226,8 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         score = 5
         if rs_diff is not None and rs_diff > 0:
             score += 2
+        if "Positive free cash flow" in fundamentals.get("fundamental_flags", []):
+            score += 1
 
         setups.append(
             Setup(
@@ -239,6 +272,8 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         coiled_score += 1
     if price > ma150:
         coiled_score += 1
+    if "High revenue growth" in fundamentals.get("fundamental_flags", []):
+        coiled_score += 1
 
     if coiled_score >= 5 and distance_from_ma50 < 10:
         setups.append(
@@ -263,8 +298,10 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         "ma50": round(ma50, 2),
         "ma150": round(ma150, 2),
         "rsi": round(rsi, 1),
+        "distance_from_ma50_pct": round(distance_from_ma50, 2),
         "distance_from_ma150_pct": round(distance_from_ma150, 2),
         "rs_20d_vs_qqq": rs_diff,
+        "fundamentals": fundamentals,
         "setups": [asdict(s) for s in sorted(setups, key=lambda s: s.score, reverse=True)],
     }
 
@@ -284,6 +321,7 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
             continue
 
         for setup in result.get("setups", []):
+            setup["fundamentals"] = result.get("fundamentals", {})
             found.append(setup)
 
     found.sort(
