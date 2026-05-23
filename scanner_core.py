@@ -18,7 +18,21 @@ DEFAULT_TICKERS = [
     "IREN", "ETN", "NRG", "VST", "CEG", "GEV", "VRT", "MP", "MSTR", "CLSK",
     "IBIT", "GLD", "SLV", "BABA", "ZIM", "ODD", "CRWV"
 ]
-
+MARKET_INDEXES = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "SOXX",
+    "SMH",
+    "IGV",
+    "XLF",
+    "XLE",
+    "XLK",
+    "XLV",
+    "XLI",
+    "XLY",
+    "XLC",
+]
 @dataclass
 class Setup:
     ticker: str
