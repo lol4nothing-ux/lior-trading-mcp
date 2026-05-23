@@ -32,7 +32,18 @@ CORE_MARKET = [
     "RSP", "SPY", "^GSPC", "QQQM", "^NDX", "^DJI", "IWM"
 ]
 
-MACRO = ["TIP", "DX-Y.NYB", "LQD", "HYG"]
+MACRO = [
+    "TIP",
+    "DX-Y.NYB",
+    "LQD",
+    "HYG",
+
+    # US Treasury yields
+    "^IRX",   # 13-week / short-term proxy
+    "^FVX",   # 5Y yield
+    "^TNX",   # 10Y yield
+    "^TYX",   # 30Y yield
+]
 
 SECTORS = [
     "XAR", "MAGS", "SOXX", "SMH", "CIBR", "HACK", "TAN",
@@ -72,6 +83,7 @@ def download_daily(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
             auto_adjust=True,
             progress=False,
             threads=False,
+            timeout=12,
         )
         if df is None or df.empty or len(df) < 170:
             return None
@@ -149,10 +161,10 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
             "forward_pe": forward_pe,
             "peg_like": round(peg_like, 2) if peg_like is not None else None,
             "price_to_sales": info.get("priceToSalesTrailing12Months"),
-            "revenue_growth": round(revenue_growth * 100, 2) if revenue_growth is not None else None,
-            "gross_margins": round(info.get("grossMargins") * 100, 2) if info.get("grossMargins") is not None else None,
-            "operating_margins": round(info.get("operatingMargins") * 100, 2) if info.get("operatingMargins") is not None else None,
-            "profit_margins": round(info.get("profitMargins") * 100, 2) if info.get("profitMargins") is not None else None,
+            "revenue_growth_pct": round(revenue_growth * 100, 2) if revenue_growth is not None else None,
+            "gross_margins_pct": round(info.get("grossMargins") * 100, 2) if info.get("grossMargins") is not None else None,
+            "operating_margins_pct": round(info.get("operatingMargins") * 100, 2) if info.get("operatingMargins") is not None else None,
+            "profit_margins_pct": round(info.get("profitMargins") * 100, 2) if info.get("profitMargins") is not None else None,
             "free_cashflow": info.get("freeCashflow"),
             "analyst_target": info.get("targetMeanPrice"),
             "short_float_pct": round(info.get("shortPercentOfFloat") * 100, 2) if info.get("shortPercentOfFloat") is not None else None,
@@ -162,7 +174,7 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
         return {"fundamental_error": str(e)}
 
 
-def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
+def _technical_analysis(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
     ticker = ticker.upper().strip()
 
     df = download_daily(ticker)
@@ -189,7 +201,6 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
     distance_from_ma50 = ((price / ma50) - 1) * 100
     distance_from_ma150 = ((price / ma150) - 1) * 100
 
-    fundamentals = get_fundamentals(ticker)
     setups: List[Setup] = []
 
     if price > ma150 and 45 <= rsi <= 68 and 0 < distance_to_breakout <= 5 and distance_from_ma50 <= 8:
@@ -197,10 +208,6 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         if rs_diff is not None and rs_diff > 0:
             score += 2
         if price > ma50:
-            score += 1
-        if "Reasonable growth valuation" in fundamentals.get("fundamental_flags", []):
-            score += 1
-        if "High revenue growth" in fundamentals.get("fundamental_flags", []):
             score += 1
 
         setups.append(
@@ -226,8 +233,6 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         score = 5
         if rs_diff is not None and rs_diff > 0:
             score += 2
-        if "Positive free cash flow" in fundamentals.get("fundamental_flags", []):
-            score += 1
 
         setups.append(
             Setup(
@@ -272,8 +277,6 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         coiled_score += 1
     if price > ma150:
         coiled_score += 1
-    if "High revenue growth" in fundamentals.get("fundamental_flags", []):
-        coiled_score += 1
 
     if coiled_score >= 5 and distance_from_ma50 < 10:
         setups.append(
@@ -301,12 +304,29 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         "distance_from_ma50_pct": round(distance_from_ma50, 2),
         "distance_from_ma150_pct": round(distance_from_ma150, 2),
         "rs_20d_vs_qqq": rs_diff,
-        "fundamentals": fundamentals,
         "setups": [asdict(s) for s in sorted(setups, key=lambda s: s.score, reverse=True)],
     }
 
 
+def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """
+    Full single-ticker analysis:
+    technicals + fundamentals.
+    Use this only after scan_watchlist finds candidates.
+    """
+    technical = _technical_analysis(ticker, qqq_20d=qqq_20d)
+    if technical is None:
+        return None
+
+    technical["fundamentals"] = get_fundamentals(ticker)
+    return technical
+
+
 def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -> Dict[str, Any]:
+    """
+    Fast technical scan only.
+    Does NOT call fundamentals, to avoid timeouts.
+    """
     tickers = tickers or DEFAULT_TICKERS
     qqq_20d = qqq_return_20d()
 
@@ -314,14 +334,13 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
     errors = 0
 
     for ticker in tickers:
-        result = analyze_ticker(ticker.strip().upper(), qqq_20d=qqq_20d)
+        result = _technical_analysis(ticker.strip().upper(), qqq_20d=qqq_20d)
 
         if result is None:
             errors += 1
             continue
 
         for setup in result.get("setups", []):
-            setup["fundamentals"] = result.get("fundamentals", {})
             found.append(setup)
 
     found.sort(
@@ -334,6 +353,7 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
         "qqq_20d_return": round(qqq_20d, 2) if qqq_20d is not None else None,
         "errors": errors,
         "results": found[:max_results],
+        "note": "Technical scan only. Run analyze_ticker on selected candidates for fundamentals.",
     }
 
 
