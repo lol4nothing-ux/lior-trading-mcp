@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 from ta.momentum import RSIIndicator
-
+from datetime import datetime, timezone
 
 DEFAULT_TICKERS = [
     "MSFT", "AAPL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "AMD", "INTC",
@@ -172,7 +172,99 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {"fundamental_error": str(e)}
+        
+def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Fetch latest ticker-related news from yfinance.
+    This is a lightweight first version. Later we can add Investing.com RSS / other sources.
+    """
+    ticker = ticker.upper().strip()
 
+    try:
+        raw_news = yf.Ticker(ticker).news or []
+        results: List[Dict[str, Any]] = []
+
+        for item in raw_news[:limit]:
+            published_raw = item.get("providerPublishTime")
+            published_utc = None
+
+            if published_raw:
+                try:
+                    published_utc = datetime.fromtimestamp(
+                        published_raw,
+                        tz=timezone.utc
+                    ).isoformat()
+                except Exception:
+                    published_utc = published_raw
+
+            title = item.get("title")
+            publisher = item.get("publisher")
+            link = item.get("link")
+            item_type = item.get("type")
+
+            importance = "LOW"
+            impact = "UNKNOWN"
+            reason = []
+
+            title_l = (title or "").lower()
+
+            high_keywords = [
+                "earnings", "guidance", "forecast", "outlook",
+                "downgrade", "upgrade", "price target",
+                "sec", "lawsuit", "probe", "investigation",
+                "antitrust", "merger", "acquisition",
+                "contract", "deal", "partnership",
+                "beats", "misses"
+            ]
+
+            medium_keywords = [
+                "analyst", "shares", "stock", "ai",
+                "data center", "chip", "cloud",
+                "bitcoin", "crypto", "oil", "fed",
+                "rates", "tariff", "iran"
+            ]
+
+            negative_keywords = [
+                "downgrade", "misses", "lawsuit", "probe",
+                "investigation", "antitrust", "cuts",
+                "falls", "drops", "warning"
+            ]
+
+            positive_keywords = [
+                "upgrade", "beats", "raises", "wins",
+                "contract", "partnership", "surges",
+                "rises", "record"
+            ]
+
+            if any(k in title_l for k in high_keywords):
+                importance = "HIGH"
+                reason.append("contains high-impact keyword")
+            elif any(k in title_l for k in medium_keywords):
+                importance = "MEDIUM"
+                reason.append("contains market-relevant keyword")
+
+            if any(k in title_l for k in negative_keywords):
+                impact = "NEGATIVE"
+            elif any(k in title_l for k in positive_keywords):
+                impact = "POSITIVE"
+
+            results.append({
+                "title": title,
+                "publisher": publisher,
+                "published_utc": published_utc,
+                "type": item_type,
+                "link": link,
+                "importance": importance,
+                "estimated_impact": impact,
+                "reason": reason,
+            })
+
+        return results
+
+    except Exception as e:
+        return [{
+            "news_error": str(e)
+        }]
 
 def _technical_analysis(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
     ticker = ticker.upper().strip()
@@ -311,14 +403,18 @@ def _technical_analysis(ticker: str, qqq_20d: Optional[float] = None) -> Optiona
 def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """
     Full single-ticker analysis:
-    technicals + fundamentals.
-    Use this only after scan_watchlist finds candidates.
+    technicals + fundamentals + latest news.
+    Use this only after scan_watchlist finds candidates, or when the user asks for a specific ticker.
     """
+    ticker = ticker.upper().strip()
+
     technical = _technical_analysis(ticker, qqq_20d=qqq_20d)
     if technical is None:
         return None
 
     technical["fundamentals"] = get_fundamentals(ticker)
+    technical["latest_news"] = get_latest_news(ticker)
+
     return technical
 
 
