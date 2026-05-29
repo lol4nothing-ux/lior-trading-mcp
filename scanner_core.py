@@ -7,6 +7,7 @@ import pandas as pd
 import yfinance as yf
 from ta.momentum import RSIIndicator
 from datetime import datetime, timezone
+from datetime import datetime, timezone
 
 DEFAULT_TICKERS = [
     "MSFT", "AAPL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "AMD", "INTC",
@@ -176,12 +177,13 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
 def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
     """
     Fetch latest ticker-related news from yfinance.
-    This is a lightweight first version. Later we can add Investing.com RSS / other sources.
     """
     ticker = ticker.upper().strip()
 
     try:
-        raw_news = yf.Ticker(ticker).news or []
+        stock = yf.Ticker(ticker)
+        raw_news = stock.news or []
+
         results: List[Dict[str, Any]] = []
 
         for item in raw_news[:limit]:
@@ -195,18 +197,18 @@ def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
                         tz=timezone.utc
                     ).isoformat()
                 except Exception:
-                    published_utc = published_raw
+                    published_utc = str(published_raw)
 
             title = item.get("title")
             publisher = item.get("publisher")
             link = item.get("link")
             item_type = item.get("type")
 
+            title_l = (title or "").lower()
+
             importance = "LOW"
             impact = "UNKNOWN"
             reason = []
-
-            title_l = (title or "").lower()
 
             high_keywords = [
                 "earnings", "guidance", "forecast", "outlook",
@@ -238,10 +240,10 @@ def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
 
             if any(k in title_l for k in high_keywords):
                 importance = "HIGH"
-                reason.append("contains high-impact keyword")
+                reason.append("high-impact keyword")
             elif any(k in title_l for k in medium_keywords):
                 importance = "MEDIUM"
-                reason.append("contains market-relevant keyword")
+                reason.append("market-relevant keyword")
 
             if any(k in title_l for k in negative_keywords):
                 impact = "NEGATIVE"
