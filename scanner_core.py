@@ -174,37 +174,145 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
     except Exception as e:
         return {"fundamental_error": str(e)}
         
-def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
+def _parse_news_datetime(value: Any) -> Optional[datetime]:
     """
-    Fetch latest ticker-related news from yfinance.
+    Supports:
+    - Unix timestamp
+    - ISO datetime strings
+    - Yahoo/yfinance pubDate formats
+    """
+    if value is None:
+        return None
+
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        try:
+            # Handles 2026-06-02T14:30:00Z
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+        try:
+            # Fallback for some Yahoo-style date strings
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    return None
+
+
+def _extract_news_url(item: Dict[str, Any], content: Dict[str, Any]) -> Optional[str]:
+    """
+    Handles old and new yfinance/Yahoo schemas.
+    """
+    direct = item.get("link") or item.get("url")
+    if direct:
+        return direct
+
+    canonical = content.get("canonicalUrl")
+    if isinstance(canonical, dict):
+        if canonical.get("url"):
+            return canonical.get("url")
+
+    clickthrough = content.get("clickThroughUrl")
+    if isinstance(clickthrough, dict):
+        if clickthrough.get("url"):
+            return clickthrough.get("url")
+
+    return None
+
+
+def _extract_news_provider(item: Dict[str, Any], content: Dict[str, Any]) -> Optional[str]:
+    provider = item.get("publisher")
+
+    if provider:
+        return provider
+
+    provider_obj = content.get("provider")
+    if isinstance(provider_obj, dict):
+        return (
+            provider_obj.get("displayName")
+            or provider_obj.get("name")
+            or provider_obj.get("source")
+        )
+
+    return None
+
+
+def get_latest_news(
+    ticker: str,
+    limit: int = 8,
+    lookback_hours: int = 72
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent ticker-related news from yfinance/Yahoo Finance.
+
+    Strict rules:
+    - Keeps only news with title + source + published time + url.
+    - Keeps only news from the last lookback_hours.
+    - Distinguishes provider failure from no fresh news.
     """
     ticker = ticker.upper().strip()
+    now = datetime.now(timezone.utc)
+    cutoff = now - pd.Timedelta(hours=lookback_hours)
 
     try:
         stock = yf.Ticker(ticker)
         raw_news = stock.news or []
 
+        if not raw_news:
+            return [{
+                "news_status": "NO_NEWS_RETURNED_BY_PROVIDER",
+                "ticker": ticker,
+                "message": "Yahoo/yfinance returned no news items."
+            }]
+
         results: List[Dict[str, Any]] = []
 
-        for item in raw_news[:limit]:
-            published_raw = item.get("providerPublishTime")
-            published_utc = None
+        for item in raw_news:
+            if not isinstance(item, dict):
+                continue
 
-            if published_raw:
-                try:
-                    published_utc = datetime.fromtimestamp(
-                        published_raw,
-                        tz=timezone.utc
-                    ).isoformat()
-                except Exception:
-                    published_utc = str(published_raw)
+            content = item.get("content") or {}
+            if not isinstance(content, dict):
+                content = {}
 
-            title = item.get("title")
-            publisher = item.get("publisher")
-            link = item.get("link")
-            item_type = item.get("type")
+            title = (
+                item.get("title")
+                or content.get("title")
+                or content.get("headline")
+            )
 
-            title_l = (title or "").lower()
+            publisher = _extract_news_provider(item, content)
+            link = _extract_news_url(item, content)
+
+            published_dt = (
+                _parse_news_datetime(item.get("providerPublishTime"))
+                or _parse_news_datetime(item.get("published_at"))
+                or _parse_news_datetime(content.get("pubDate"))
+                or _parse_news_datetime(content.get("displayTime"))
+            )
+
+            if not title or not publisher or not link or not published_dt:
+                continue
+
+            if published_dt < cutoff:
+                continue
+
+            title_l = title.lower()
 
             importance = "LOW"
             impact = "UNKNOWN"
@@ -216,26 +324,26 @@ def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
                 "sec", "lawsuit", "probe", "investigation",
                 "antitrust", "merger", "acquisition",
                 "contract", "deal", "partnership",
-                "beats", "misses"
+                "beats", "misses", "revenue", "eps"
             ]
 
             medium_keywords = [
                 "analyst", "shares", "stock", "ai",
                 "data center", "chip", "cloud",
                 "bitcoin", "crypto", "oil", "fed",
-                "rates", "tariff", "iran"
+                "rates", "tariff", "iran", "export controls"
             ]
 
             negative_keywords = [
                 "downgrade", "misses", "lawsuit", "probe",
                 "investigation", "antitrust", "cuts",
-                "falls", "drops", "warning"
+                "falls", "drops", "warning", "slumps"
             ]
 
             positive_keywords = [
                 "upgrade", "beats", "raises", "wins",
                 "contract", "partnership", "surges",
-                "rises", "record"
+                "rises", "record", "tops"
             ]
 
             if any(k in title_l for k in high_keywords):
@@ -251,20 +359,33 @@ def get_latest_news(ticker: str, limit: int = 8) -> List[Dict[str, Any]]:
                 impact = "POSITIVE"
 
             results.append({
-                "title": title,
+                "ticker": ticker,
+                "title": title.strip(),
                 "publisher": publisher,
-                "published_utc": published_utc,
-                "type": item_type,
+                "published_utc": published_dt.isoformat(),
+                "age_hours": round((now - published_dt).total_seconds() / 3600, 2),
                 "link": link,
                 "importance": importance,
                 "estimated_impact": impact,
                 "reason": reason,
             })
 
-        return results
+        results.sort(key=lambda x: x.get("published_utc", ""), reverse=True)
+
+        if not results:
+            return [{
+                "news_status": "NO_FRESH_NEWS",
+                "ticker": ticker,
+                "lookback_hours": lookback_hours,
+                "message": f"No valid fresh news found in the last {lookback_hours} hours."
+            }]
+
+        return results[:limit]
 
     except Exception as e:
         return [{
+            "news_status": "NEWS_PROVIDER_FAILED",
+            "ticker": ticker,
             "news_error": str(e)
         }]
 
@@ -415,7 +536,7 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
         return None
 
     technical["fundamentals"] = get_fundamentals(ticker)
-    technical["latest_news"] = get_latest_news(ticker)
+    technical["latest_news"] = get_latest_news(ticker, limit=8, lookback_hours=72)
 
     return technical
 
