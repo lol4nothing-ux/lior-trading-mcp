@@ -28,4 +28,12 @@ def market_map():
     return scanner_core.market_map()
 
 
+@mcp.tool()
+def analyze_volume(ticker: str):
+    """
+    Analyze unusual intraday volume and pre-close interest for a ticker.
+    """
+    return scanner_core.analyze_volume(ticker.upper())
+
+
 app = mcp.http_app(path="/mcp")
