@@ -6,8 +6,25 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import yfinance as yf
 from ta.momentum import RSIIndicator
-from datetime import datetime, timezone
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
+
+LOOKBACK_SESSIONS = 20
+PRE_CLOSE_WINDOW_MINUTES = 120
+SHORT_WINDOW_MINUTES = 30
+EXTENDED_INTRADAY_PCT = 7.0
+EXTENDED_VWAP_DISTANCE_PCT = 5.0
+MIN_AVG_DOLLAR_VOLUME_20D = 20_000_000
+MIN_HISTORICAL_INTRADAY_SESSIONS = 10
+US_EASTERN = ZoneInfo("America/New_York")
+
+VOLUME_SIGNAL_NO_UNUSUAL = "NO_UNUSUAL_VOLUME"
+VOLUME_SIGNAL_MILD = "MILD_INTEREST"
+VOLUME_SIGNAL_STRONG = "STRONG_POSITIVE_INTEREST"
+VOLUME_SIGNAL_ACCUMULATION = "POSSIBLE_ACCUMULATION"
+VOLUME_SIGNAL_DISTRIBUTION = "DISTRIBUTION_RISK"
+VOLUME_SIGNAL_CHASE = "CHASE_RISK"
+VOLUME_SIGNAL_INSUFFICIENT = "INSUFFICIENT_DATA"
 
 DEFAULT_TICKERS = [
     "MSFT", "AAPL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "AMD", "INTC",
@@ -87,6 +104,24 @@ def download_daily(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
             timeout=12,
         )
         if df is None or df.empty or len(df) < 170:
+            return None
+        return _flatten(df).dropna()
+    except Exception:
+        return None
+
+
+def download_intraday(ticker: str, period: str = "30d", interval: str = "5m") -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            timeout=12,
+        )
+        if df is None or df.empty:
             return None
         return _flatten(df).dropna()
     except Exception:
@@ -523,6 +558,387 @@ def _technical_analysis(ticker: str, qqq_20d: Optional[float] = None) -> Optiona
     }
 
 
+def analyze_volume(ticker: str) -> Dict[str, Any]:
+    """
+    Analyze unusual intraday volume and pre-close interest.
+
+    If intraday OHLCV is unavailable or the provider fails, return a normal
+    INSUFFICIENT_DATA object instead of breaking the MCP tool.
+    """
+    ticker = ticker.upper().strip()
+    try:
+        return _analyze_volume_interest(ticker)
+    except Exception as exc:
+        result = _empty_volume_interest()
+        result["volume_explanation_he"] = "אין מספיק נתוני ווליום תוך-יומיים לחישוב אמין."
+        result["volume_error"] = str(exc)
+        return result
+
+
+def _analyze_volume_interest(ticker: str) -> Dict[str, Any]:
+    result = _empty_volume_interest()
+
+    daily = download_daily(ticker, period="1y")
+    avg_dollar_volume = _avg_daily_dollar_volume(daily)
+    liquidity_ok = (
+        avg_dollar_volume >= MIN_AVG_DOLLAR_VOLUME_20D
+        if avg_dollar_volume is not None
+        else None
+    )
+    result["avg_daily_dollar_volume_20d"] = _round(avg_dollar_volume)
+    result["liquidity_ok"] = liquidity_ok
+
+    intraday_raw = download_intraday(ticker, period="30d", interval="5m")
+    intraday = _prepare_intraday(intraday_raw)
+    if intraday.empty:
+        result["volume_explanation_he"] = "אין נתוני ווליום תוך-יומיים זמינים."
+        return result
+
+    session_dates = sorted(intraday["session_date"].dropna().unique())
+    if len(session_dates) < MIN_HISTORICAL_INTRADAY_SESSIONS + 1:
+        result["volume_explanation_he"] = "אין מספיק היסטוריה תוך-יומית אמינה לחישוב RVOL לפי שעה."
+        return result
+
+    latest_date = session_dates[-1]
+    historical_dates = session_dates[-(LOOKBACK_SESSIONS + 1):-1]
+    today = intraday[intraday["session_date"] == latest_date].copy()
+    historical = intraday[intraday["session_date"].isin(historical_dates)].copy()
+
+    if today.empty or historical.empty:
+        result["volume_explanation_he"] = "נתוני הווליום התוך-יומיים חסרים או קצרים מדי."
+        return result
+
+    latest_ts = today["timestamp_eastern"].max()
+    latest_tod = latest_ts.time()
+    short_start = (latest_ts - pd.Timedelta(minutes=SHORT_WINDOW_MINUTES)).time()
+    long_start = (latest_ts - pd.Timedelta(minutes=PRE_CLOSE_WINDOW_MINUTES)).time()
+
+    cumulative_today = _sum_until(today, latest_tod)
+    cumulative_avg = _average_session_sum(historical, None, latest_tod)
+    last_2h_today = _sum_window(today, long_start, latest_tod)
+    last_2h_avg = _average_session_sum(historical, long_start, latest_tod)
+    last_30m_today = _sum_window(today, short_start, latest_tod)
+    last_30m_avg = _average_session_sum(historical, short_start, latest_tod)
+    previous_90m_today = _sum_window(today, long_start, short_start)
+    previous_90m_avg = _average_session_sum(historical, long_start, short_start)
+
+    cumulative_rvol = _safe_ratio(cumulative_today, cumulative_avg)
+    last_2h_ratio = _safe_ratio(last_2h_today, last_2h_avg)
+    last_30m_ratio = _safe_ratio(last_30m_today, last_30m_avg)
+    previous_90m_ratio = _safe_ratio(previous_90m_today, previous_90m_avg)
+    acceleration = _safe_ratio(last_30m_ratio, previous_90m_ratio)
+
+    price = _safe_float(today.iloc[-1].get("Close"))
+    first_open = _safe_float(today.iloc[0].get("Open"))
+    day_high = _safe_float(today["High"].max())
+    day_low = _safe_float(today["Low"].min())
+    vwap = _vwap(today)
+
+    price_vs_vwap_pct = _pct_change(price, vwap)
+    above_vwap = price > vwap if price is not None and vwap not in (None, 0) else None
+    day_range_position = _day_range_position(price, day_low, day_high)
+    intraday_change = _pct_change(price, first_open)
+    extended = _extended_intraday(intraday_change, price_vs_vwap_pct)
+
+    score = _score_volume_interest(
+        cumulative_rvol=cumulative_rvol,
+        last_2h_ratio=last_2h_ratio,
+        last_30m_ratio=last_30m_ratio,
+        acceleration=acceleration,
+        above_vwap=above_vwap,
+        day_range_position=day_range_position,
+        extended=extended,
+        liquidity_ok=liquidity_ok,
+    )
+    if liquidity_ok is False:
+        score = min(score, 6.0)
+
+    signal = _volume_signal(
+        cumulative_rvol=cumulative_rvol,
+        last_2h_ratio=last_2h_ratio,
+        above_vwap=above_vwap,
+        day_range_position=day_range_position,
+        intraday_change=intraday_change,
+        extended=extended,
+    )
+
+    result.update(
+        {
+            "volume_interest_score": round(score, 2),
+            "volume_signal": signal,
+            "volume_explanation_he": _volume_explanation_he(signal, liquidity_ok),
+            "cumulative_rvol_by_time": _round(cumulative_rvol),
+            "last_2h_volume_ratio": _round(last_2h_ratio),
+            "last_30m_volume_ratio": _round(last_30m_ratio),
+            "volume_acceleration": _round(acceleration),
+            "above_vwap": above_vwap,
+            "price_vs_vwap_pct": _round(price_vs_vwap_pct),
+            "day_range_position_pct": _round(day_range_position),
+            "intraday_change_pct": _round(intraday_change),
+            "extended_intraday": extended,
+            "avg_daily_dollar_volume_20d": _round(avg_dollar_volume),
+            "liquidity_ok": liquidity_ok,
+        }
+    )
+    return result
+
+
+def _empty_volume_interest() -> Dict[str, Any]:
+    return {
+        "volume_interest_score": 0,
+        "volume_signal": VOLUME_SIGNAL_INSUFFICIENT,
+        "volume_explanation_he": "אין מספיק נתונים לחישוב ווליום חריג.",
+        "cumulative_rvol_by_time": None,
+        "last_2h_volume_ratio": None,
+        "last_30m_volume_ratio": None,
+        "volume_acceleration": None,
+        "above_vwap": None,
+        "price_vs_vwap_pct": None,
+        "day_range_position_pct": None,
+        "intraday_change_pct": None,
+        "extended_intraday": None,
+        "avg_daily_dollar_volume_20d": None,
+        "liquidity_ok": None,
+    }
+
+
+def _prepare_intraday(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    out = df.copy()
+    for column in required:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+
+    out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    out = out[out["Volume"] > 0]
+    if out.empty:
+        return pd.DataFrame()
+
+    timestamps = pd.to_datetime(out.index)
+    if getattr(timestamps, "tz", None) is None:
+        timestamps = timestamps.tz_localize(US_EASTERN)
+    else:
+        timestamps = timestamps.tz_convert(US_EASTERN)
+
+    out["timestamp_eastern"] = timestamps
+    out = out[_regular_session_mask(out["timestamp_eastern"])]
+    if out.empty:
+        return pd.DataFrame()
+
+    out["session_date"] = out["timestamp_eastern"].dt.date
+    out["session_time"] = out["timestamp_eastern"].dt.time
+    return out.sort_values("timestamp_eastern").reset_index(drop=True)
+
+
+def _regular_session_mask(series: pd.Series) -> pd.Series:
+    session_start = time(9, 30)
+    session_end = time(16, 0)
+    session_times = series.dt.time
+    return (session_times >= session_start) & (session_times <= session_end)
+
+
+def _sum_until(df: pd.DataFrame, end: time) -> float:
+    return float(df[df["session_time"] <= end]["Volume"].sum())
+
+
+def _sum_window(df: pd.DataFrame, start: time, end: time) -> float:
+    if start <= end:
+        mask = (df["session_time"] > start) & (df["session_time"] <= end)
+    else:
+        mask = df["session_time"] <= end
+    return float(df[mask]["Volume"].sum())
+
+
+def _average_session_sum(df: pd.DataFrame, start: Optional[time], end: time) -> Optional[float]:
+    values: List[float] = []
+    for _, session in df.groupby("session_date"):
+        value = _sum_until(session, end) if start is None else _sum_window(session, start, end)
+        if value > 0:
+            values.append(value)
+
+    if len(values) < MIN_HISTORICAL_INTRADAY_SESSIONS:
+        return None
+
+    return float(sum(values) / len(values))
+
+
+def _vwap(df: pd.DataFrame) -> Optional[float]:
+    volume = df["Volume"].sum()
+    if volume in (None, 0):
+        return None
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    return float((typical_price * df["Volume"]).sum() / volume)
+
+
+def _avg_daily_dollar_volume(df: Optional[pd.DataFrame]) -> Optional[float]:
+    if df is None or df.empty or "Close" not in df.columns or "Volume" not in df.columns:
+        return None
+    recent = df.dropna(subset=["Close", "Volume"]).tail(LOOKBACK_SESSIONS)
+    if len(recent) < MIN_HISTORICAL_INTRADAY_SESSIONS:
+        return None
+    return float((recent["Close"] * recent["Volume"]).mean())
+
+
+def _score_volume_interest(
+    cumulative_rvol: Optional[float],
+    last_2h_ratio: Optional[float],
+    last_30m_ratio: Optional[float],
+    acceleration: Optional[float],
+    above_vwap: Optional[bool],
+    day_range_position: Optional[float],
+    extended: Optional[bool],
+    liquidity_ok: Optional[bool],
+) -> float:
+    score = 0.0
+    score += _tier(cumulative_rvol, [(3.0, 3.0), (2.0, 2.5), (1.5, 2.0), (1.2, 1.0)])
+    score += _tier(last_2h_ratio, [(3.0, 2.0), (2.0, 1.6), (1.5, 1.2), (1.2, 0.6)])
+    score += min(
+        _tier(last_30m_ratio, [(2.0, 0.9), (1.5, 0.65), (1.2, 0.35)])
+        + _tier(acceleration, [(1.5, 0.6), (1.2, 0.35)]),
+        1.5,
+    )
+
+    if above_vwap is True:
+        score += 1.0
+
+    if day_range_position is not None:
+        if day_range_position >= 80:
+            score += 1.0
+        elif day_range_position >= 65:
+            score += 0.7
+        elif day_range_position >= 50:
+            score += 0.35
+
+    if extended is False:
+        score += 1.0
+    elif extended is None:
+        score += 0.25
+
+    if liquidity_ok is True:
+        score += 0.5
+
+    return min(score, 10.0)
+
+
+def _tier(value: Optional[float], levels: List[tuple]) -> float:
+    if value is None:
+        return 0.0
+    for threshold, points in levels:
+        if value >= threshold:
+            return points
+    return 0.0
+
+
+def _volume_signal(
+    cumulative_rvol: Optional[float],
+    last_2h_ratio: Optional[float],
+    above_vwap: Optional[bool],
+    day_range_position: Optional[float],
+    intraday_change: Optional[float],
+    extended: Optional[bool],
+) -> str:
+    high_rvol = max(cumulative_rvol or 0, last_2h_ratio or 0)
+
+    if high_rvol >= 3.0 and extended is True:
+        return VOLUME_SIGNAL_CHASE
+
+    if high_rvol >= 1.5 and above_vwap is False and (day_range_position or 100) <= 35:
+        return VOLUME_SIGNAL_DISTRIBUTION
+
+    if (
+        (cumulative_rvol or 0) >= 1.5
+        and (last_2h_ratio or 0) >= 1.5
+        and above_vwap is True
+        and (day_range_position or 0) >= 65
+        and extended is False
+    ):
+        return VOLUME_SIGNAL_STRONG
+
+    if (
+        high_rvol >= 1.5
+        and above_vwap is True
+        and intraday_change is not None
+        and -1.0 <= intraday_change <= 4.0
+        and extended is False
+    ):
+        return VOLUME_SIGNAL_ACCUMULATION
+
+    if high_rvol >= 1.2:
+        return VOLUME_SIGNAL_MILD
+
+    return VOLUME_SIGNAL_NO_UNUSUAL
+
+
+def _volume_explanation_he(signal: str, liquidity_ok: Optional[bool]) -> str:
+    explanations = {
+        VOLUME_SIGNAL_STRONG: "ווליום חריג חיובי: המחיר מעל VWAP והווליום בשעתיים האחרונות גבוה מהממוצע.",
+        VOLUME_SIGNAL_ACCUMULATION: "ייתכן איסוף: ווליום חריג בלי תזוזת מחיר גדולה, והמחיר מחזיק מעל VWAP.",
+        VOLUME_SIGNAL_CHASE: "סיכון רדיפה: הווליום חריג אך המחיר כבר עלה חזק מדי.",
+        VOLUME_SIGNAL_DISTRIBUTION: "סיכון הפצה: ווליום חריג אך המחיר מתחת ל-VWAP ובחלק התחתון של הטווח היומי.",
+        VOLUME_SIGNAL_MILD: "יש עניין ווליום מתון, אבל אין עדיין אישור מספיק חזק.",
+        VOLUME_SIGNAL_NO_UNUSUAL: "אין ווליום חריג ביחס לשעה הנוכחית.",
+        VOLUME_SIGNAL_INSUFFICIENT: "אין מספיק נתונים לחישוב ווליום חריג.",
+    }
+    text = explanations.get(signal, explanations[VOLUME_SIGNAL_INSUFFICIENT])
+    if liquidity_ok is False:
+        text += " נזילות נמוכה יחסית, לכן הציון מוגבל ויש סיכון החלקה."
+    return text
+
+
+def _extended_intraday(
+    intraday_change: Optional[float],
+    price_vs_vwap_pct: Optional[float],
+) -> Optional[bool]:
+    if intraday_change is None and price_vs_vwap_pct is None:
+        return None
+    return (
+        (intraday_change or 0) > EXTENDED_INTRADAY_PCT
+        or (price_vs_vwap_pct or 0) > EXTENDED_VWAP_DISTANCE_PCT
+    )
+
+
+def _day_range_position(
+    price: Optional[float],
+    low: Optional[float],
+    high: Optional[float],
+) -> Optional[float]:
+    if price is None or low is None or high is None or high <= low:
+        return None
+    return max(0.0, min(100.0, ((price - low) / (high - low)) * 100))
+
+
+def _pct_change(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous in (None, 0):
+        return None
+    return ((current - previous) / previous) * 100
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return numerator / denominator
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _round(value: Optional[float]) -> Optional[float]:
+    return None if value is None else round(value, 2)
+
+
 def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """
     Full single-ticker analysis:
@@ -535,6 +951,7 @@ def analyze_ticker(ticker: str, qqq_20d: Optional[float] = None) -> Optional[Dic
     if technical is None:
         return None
 
+    technical["volume_interest"] = analyze_volume(ticker)
     technical["fundamentals"] = get_fundamentals(ticker)
     technical["latest_news"] = get_latest_news(ticker, limit=8, lookback_hours=72)
 
@@ -550,20 +967,38 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
     qqq_20d = qqq_return_20d()
 
     found: List[Dict[str, Any]] = []
+    volume_cache: Dict[str, Dict[str, Any]] = {}
     errors = 0
 
     for ticker in tickers:
-        result = _technical_analysis(ticker.strip().upper(), qqq_20d=qqq_20d)
+        normalized_ticker = ticker.strip().upper()
+        result = _technical_analysis(normalized_ticker, qqq_20d=qqq_20d)
 
         if result is None:
             errors += 1
             continue
 
         for setup in result.get("setups", []):
+            if normalized_ticker not in volume_cache:
+                volume_cache[normalized_ticker] = analyze_volume(normalized_ticker)
+
+            volume_interest = volume_cache[normalized_ticker]
+            volume_score = volume_interest.get("volume_interest_score") or 0
+            setup["volume_interest"] = volume_interest
+            setup["volume_interest_score"] = volume_interest.get("volume_interest_score")
+            setup["combined_score"] = round(
+                (setup.get("score") or 0) + min(float(volume_score), 3.0),
+                2,
+            )
             found.append(setup)
 
     found.sort(
-        key=lambda x: (x.get("score", 0), x.get("rs_20d_vs_qqq") or -999),
+        key=lambda x: (
+            x.get("combined_score") or x.get("score", 0),
+            x.get("score", 0),
+            x.get("volume_interest_score") or 0,
+            x.get("rs_20d_vs_qqq") or -999,
+        ),
         reverse=True,
     )
 
