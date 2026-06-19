@@ -16,6 +16,11 @@ EXTENDED_INTRADAY_PCT = 7.0
 EXTENDED_VWAP_DISTANCE_PCT = 5.0
 MIN_AVG_DOLLAR_VOLUME_20D = 20_000_000
 MIN_HISTORICAL_INTRADAY_SESSIONS = 10
+VOLUME_ENRICH_TOTAL_LIMIT = 10
+VOLUME_ENRICH_BREAKOUT_NOW_LIMIT = 5
+VOLUME_ENRICH_NEAR_BREAKOUT_LIMIT = 5
+VOLUME_ENRICH_COILED_LIMIT = 3
+BREADTH_MAX_SYMBOLS = 80
 US_EASTERN = ZoneInfo("America/New_York")
 
 VOLUME_SIGNAL_NO_UNUSUAL = "NO_UNUSUAL_VOLUME"
@@ -26,7 +31,8 @@ VOLUME_SIGNAL_DISTRIBUTION = "DISTRIBUTION_RISK"
 VOLUME_SIGNAL_CHASE = "CHASE_RISK"
 VOLUME_SIGNAL_INSUFFICIENT = "INSUFFICIENT_DATA"
 
-DEFAULT_TICKERS = [
+# Original manually curated MCP scanner universe.
+BASE_TICKERS = [
     "MSFT", "AAPL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "AMD", "INTC",
     "TSM", "MU", "SMCI", "ARM", "QCOM", "SNPS", "ANET", "DELL",
     "CRWD", "PANW", "FTNT", "DDOG", "ZS", "NET", "MDB", "CRM", "NOW", "ORCL",
@@ -44,6 +50,34 @@ DEFAULT_TICKERS = [
     "XLF", "XLE", "XLV", "XLI", "XLY", "XLC", "XLB", "XLU", "XLP", "XLRE",
     "ITB", "REMX", "NLR", "QTUM", "TAN", "MAGS",
 ]
+
+# Normalized symbols exported from TradingView watchlist:
+# https://www.tradingview.com/watchlists/210464137/
+TRADINGVIEW_WATCHLIST_210464137 = [
+    "AAPL", "ABBNY", "AMD", "AMZN", "ANET", "AVGO", "BABA", "BAC", "BKR",
+    "BNO", "CAN", "CBRS", "CLSK", "CRM", "CRWD", "CRWV", "DDOG", "DELL",
+    "DRAM", "EPAM", "ESLT", "EXEL", "FIG", "FTNT", "GLD", "GOOG", "GRAL",
+    "HIVE", "HLT", "IBIT", "IBM", "INTC", "IREN", "JPM", "KRE", "KTOS",
+    "LLY", "MP", "MRNA", "MSFT", "MSTR", "MU", "NASA", "NBIS", "NOW",
+    "NTSK", "NVDA", "ODD", "ORBS", "ORCL", "OXY", "PANW", "PLTR", "QCOM",
+    "QQQM", "QUBT", "RDW", "RKLB", "ROBO", "RR", "SEDG", "SLB", "SLV",
+    "SMCI", "SNPS", "SOFI", "SOXL", "SPCX", "STRC", "SU", "TSM", "VRT",
+    "VST", "WGMI", "ZIM", "ZS",
+]
+
+# Normalized symbols exported from TradingView watchlist:
+# https://www.tradingview.com/watchlists/321521571/
+TRADINGVIEW_WATCHLIST_321521571 = [
+    "AMAT", "AMD", "AMZN", "ANET", "AVGO", "CLSK", "CRWD", "DELL", "ECL",
+    "GLD", "GOOG", "IBM", "INTC", "JPM", "NASA", "NBIS", "PLTR", "QQQM",
+    "QUBT", "SLV", "SOFI", "VEOEY", "WGMI", "XYL", "ZS",
+]
+
+DEFAULT_TICKERS = sorted(set(
+    BASE_TICKERS
+    + TRADINGVIEW_WATCHLIST_210464137
+    + TRADINGVIEW_WATCHLIST_321521571
+))
 
 CORE_MARKET = [
     "^VIX", "BTC-USD", "ETH-USD", "GC=F", "SI=F",
@@ -967,7 +1001,6 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
     qqq_20d = qqq_return_20d()
 
     found: List[Dict[str, Any]] = []
-    volume_cache: Dict[str, Dict[str, Any]] = {}
     errors = 0
 
     for ticker in tickers:
@@ -979,20 +1012,47 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
             continue
 
         for setup in result.get("setups", []):
-            if normalized_ticker not in volume_cache:
-                volume_cache[normalized_ticker] = analyze_volume(normalized_ticker)
-
-            volume_interest = volume_cache[normalized_ticker]
-            volume_score = volume_interest.get("volume_interest_score") or 0
-            setup["volume_interest"] = volume_interest
-            setup["volume_interest_score"] = volume_interest.get("volume_interest_score")
-            setup["combined_score"] = round(
-                (setup.get("score") or 0) + min(float(volume_score), 3.0),
-                2,
-            )
             found.append(setup)
 
     found.sort(
+        key=lambda x: (x.get("score", 0), x.get("rs_20d_vs_qqq") or -999),
+        reverse=True,
+    )
+
+    returned = found[:max_results]
+    volume_candidates = _select_volume_enrichment_candidates(returned)
+    volume_candidate_ids = {id(setup) for setup in volume_candidates}
+    volume_cache: Dict[str, Dict[str, Any]] = {}
+
+    for setup in returned:
+        technical_score = setup.get("score") or 0
+        setup["combined_score"] = technical_score
+        setup["volume_interest"] = None
+        setup["volume_interest_score"] = None
+        setup["volume_enriched"] = False
+
+        if id(setup) not in volume_candidate_ids:
+            continue
+
+        setup_ticker = str(setup.get("ticker", "")).strip().upper()
+        if setup_ticker and setup_ticker not in volume_cache:
+            try:
+                volume_cache[setup_ticker] = analyze_volume(setup_ticker)
+            except Exception:
+                volume_cache[setup_ticker] = _empty_volume_interest()
+
+        volume_interest = volume_cache.get(setup_ticker) or _empty_volume_interest()
+
+        volume_score = volume_interest.get("volume_interest_score") or 0
+        setup["volume_interest"] = volume_interest
+        setup["volume_interest_score"] = volume_interest.get("volume_interest_score")
+        setup["volume_enriched"] = True
+        setup["combined_score"] = round(
+            technical_score + min(float(volume_score), 3.0),
+            2,
+        )
+
+    returned.sort(
         key=lambda x: (
             x.get("combined_score") or x.get("score", 0),
             x.get("score", 0),
@@ -1003,15 +1063,331 @@ def scan_watchlist(tickers: Optional[List[str]] = None, max_results: int = 25) -
     )
 
     return {
-        "count": len(found[:max_results]),
+        "count": len(returned),
         "qqq_20d_return": round(qqq_20d, 2) if qqq_20d is not None else None,
         "errors": errors,
-        "results": found[:max_results],
+        "results": returned,
         "note": "Technical scan only. Run analyze_ticker on selected candidates for fundamentals.",
+        "volume_note": "Volume analysis is applied selectively to priority technical candidates to avoid timeout.",
     }
 
 
+def _select_volume_enrichment_candidates(setups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    selected_ids = set()
+
+    def add_matching(label: str, limit: int) -> None:
+        nonlocal selected
+        remaining = VOLUME_ENRICH_TOTAL_LIMIT - len(selected)
+        if remaining <= 0:
+            return
+        take = min(limit, remaining)
+        for setup in setups:
+            if len([item for item in selected if _setup_label(item) == label]) >= take:
+                return
+            if id(setup) in selected_ids:
+                continue
+            if _setup_label(setup) != label:
+                continue
+            selected.append(setup)
+            selected_ids.add(id(setup))
+
+    add_matching("BREAKOUT_NOW", VOLUME_ENRICH_BREAKOUT_NOW_LIMIT)
+    add_matching("NEAR_BREAKOUT", VOLUME_ENRICH_NEAR_BREAKOUT_LIMIT)
+    add_matching("COILED", VOLUME_ENRICH_COILED_LIMIT)
+
+    for setup in setups:
+        if len(selected) >= VOLUME_ENRICH_TOTAL_LIMIT:
+            break
+        if id(setup) in selected_ids:
+            continue
+        selected.append(setup)
+        selected_ids.add(id(setup))
+
+    return selected
+
+
+def _setup_label(setup: Dict[str, Any]) -> str:
+    value = (
+        setup.get("setup")
+        or setup.get("type")
+        or setup.get("setup_type")
+        or setup.get("name")
+        or ""
+    )
+    return str(value).strip().upper()
+
+
+def _fetch_fred_series(series_id: str) -> Optional[pd.DataFrame]:
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        df = pd.read_csv(url)
+        if df is None or df.empty or series_id not in df.columns:
+            return None
+        df["observation_date"] = pd.to_datetime(df["observation_date"], errors="coerce")
+        df[series_id] = pd.to_numeric(df[series_id].replace(".", pd.NA), errors="coerce")
+        df = df.dropna(subset=["observation_date", series_id]).sort_values("observation_date")
+        if df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _fred_latest_snapshot(series_id: str, value_change_type: str) -> Dict[str, Any]:
+    df = _fetch_fred_series(series_id)
+    if df is None or df.empty:
+        if value_change_type == "bps":
+            return {"value": None, "date": None, "change_1d_bps": None, "change_5d_bps": None}
+        return {"value": None, "date": None, "change_1d_pct": None, "change_5d_pct": None}
+
+    values = df[series_id].dropna().reset_index(drop=True)
+    dates = df.dropna(subset=[series_id])["observation_date"].reset_index(drop=True)
+    latest = float(values.iloc[-1])
+    previous = float(values.iloc[-2]) if len(values) >= 2 else None
+    previous_5 = float(values.iloc[-6]) if len(values) >= 6 else None
+
+    output: Dict[str, Any] = {
+        "value": round(latest, 2),
+        "date": dates.iloc[-1].date().isoformat(),
+    }
+    if value_change_type == "bps":
+        output["change_1d_bps"] = round((latest - previous) * 100, 2) if previous is not None else None
+        output["change_5d_bps"] = round((latest - previous_5) * 100, 2) if previous_5 is not None else None
+    else:
+        output["change_1d_pct"] = _round(_pct_change(latest, previous))
+        output["change_5d_pct"] = _round(_pct_change(latest, previous_5))
+    return output
+
+
+def _treasury_yields() -> Dict[str, Any]:
+    yields = {
+        "2y": _fred_latest_snapshot("DGS2", "bps"),
+        "5y": _fred_latest_snapshot("DGS5", "bps"),
+        "10y": _fred_latest_snapshot("DGS10", "bps"),
+        "30y": _fred_latest_snapshot("DGS30", "bps"),
+    }
+    spread_10_2 = _spread_bps(yields["10y"].get("value"), yields["2y"].get("value"))
+    spread_30_10 = _spread_bps(yields["30y"].get("value"), yields["10y"].get("value"))
+    yields["spreads"] = {
+        "10y_minus_2y_bps": spread_10_2,
+        "30y_minus_10y_bps": spread_30_10,
+        "curve_state": _curve_state(spread_10_2),
+    }
+    return yields
+
+
+def _oil_snapshot() -> Dict[str, Any]:
+    wti = _fred_latest_snapshot("DCOILWTICO", "pct")
+    brent = _fred_latest_snapshot("DCOILBRENTEU", "pct")
+    return {
+        "wti": wti,
+        "brent": brent,
+        "brent_wti_spread": _round(_safe_subtract(brent.get("value"), wti.get("value"))),
+    }
+
+
+def _spread_bps(long_yield: Optional[float], short_yield: Optional[float]) -> Optional[float]:
+    if long_yield is None or short_yield is None:
+        return None
+    return round((long_yield - short_yield) * 100, 2)
+
+
+def _safe_subtract(left: Optional[float], right: Optional[float]) -> Optional[float]:
+    if left is None or right is None:
+        return None
+    return left - right
+
+
+def _curve_state(spread_10_2: Optional[float]) -> str:
+    if spread_10_2 is None:
+        return "UNKNOWN"
+    if spread_10_2 < -10:
+        return "INVERTED_10Y_2Y"
+    if abs(spread_10_2) <= 10:
+        return "FLAT"
+    return "NORMAL"
+
+
+def _market_breadth() -> Dict[str, Any]:
+    tickers = list(dict.fromkeys(DEFAULT_TICKERS))[:BREADTH_MAX_SYMBOLS]
+    total = len(tickers)
+    symbols_with_data = 0
+    advancers = 0
+    decliners = 0
+    above_ma50 = 0
+    above_ma150 = 0
+    new_20d_high = 0
+    new_20d_low = 0
+
+    for ticker in tickers:
+        df = download_daily(ticker, period="1y")
+        if df is None or len(df) < 170:
+            continue
+        try:
+            df = add_indicators(df)
+            close = df["Close"]
+            latest = df.iloc[-1]
+            previous_close = float(close.iloc[-2])
+            latest_close = float(close.iloc[-1])
+            ma50 = float(latest["MA50"])
+            ma150 = float(latest["MA150"])
+            high_20_prev = float(df["High"].shift(1).tail(20).max())
+            low_20_prev = float(df["Low"].shift(1).tail(20).min())
+        except Exception:
+            continue
+
+        if any(pd.isna(value) for value in (previous_close, latest_close, ma50, ma150, high_20_prev, low_20_prev)):
+            continue
+
+        symbols_with_data += 1
+        if latest_close > previous_close:
+            advancers += 1
+        elif latest_close < previous_close:
+            decliners += 1
+        if latest_close > ma50:
+            above_ma50 += 1
+        if latest_close > ma150:
+            above_ma150 += 1
+        if latest_close >= high_20_prev:
+            new_20d_high += 1
+        if latest_close <= low_20_prev:
+            new_20d_low += 1
+
+    if symbols_with_data < 10:
+        return {
+            "total_symbols_checked": total,
+            "symbols_with_data": symbols_with_data,
+            "advancers_count": advancers,
+            "decliners_count": decliners,
+            "advancers_pct": None,
+            "decliners_pct": None,
+            "above_ma50_count": above_ma50,
+            "above_ma50_pct": None,
+            "above_ma150_count": above_ma150,
+            "above_ma150_pct": None,
+            "new_20d_high_count": new_20d_high,
+            "new_20d_low_count": new_20d_low,
+            "breadth_score": 0,
+            "breadth_state": "INSUFFICIENT_DATA",
+        }
+
+    advancers_pct = (advancers / symbols_with_data) * 100
+    decliners_pct = (decliners / symbols_with_data) * 100
+    above_ma50_pct = (above_ma50 / symbols_with_data) * 100
+    above_ma150_pct = (above_ma150 / symbols_with_data) * 100
+    breadth_score = _breadth_score(
+        advancers_pct,
+        above_ma50_pct,
+        above_ma150_pct,
+        new_20d_high,
+        new_20d_low,
+        symbols_with_data,
+    )
+
+    return {
+        "total_symbols_checked": total,
+        "symbols_with_data": symbols_with_data,
+        "advancers_count": advancers,
+        "decliners_count": decliners,
+        "advancers_pct": round(advancers_pct, 2),
+        "decliners_pct": round(decliners_pct, 2),
+        "above_ma50_count": above_ma50,
+        "above_ma50_pct": round(above_ma50_pct, 2),
+        "above_ma150_count": above_ma150,
+        "above_ma150_pct": round(above_ma150_pct, 2),
+        "new_20d_high_count": new_20d_high,
+        "new_20d_low_count": new_20d_low,
+        "breadth_score": round(breadth_score, 2),
+        "breadth_state": _breadth_state(breadth_score),
+    }
+
+
+def _breadth_score(
+    advancers_pct: float,
+    above_ma50_pct: float,
+    above_ma150_pct: float,
+    new_high_count: int,
+    new_low_count: int,
+    symbols_with_data: int,
+) -> float:
+    score = 0.0
+    score += min(max(advancers_pct, 0), 100) / 100 * 3
+    score += min(max(above_ma50_pct, 0), 100) / 100 * 3
+    score += min(max(above_ma150_pct, 0), 100) / 100 * 2
+    net_high_low_pct = ((new_high_count - new_low_count) / max(symbols_with_data, 1)) * 100
+    score += min(max((net_high_low_pct + 20) / 40, 0), 1) * 2
+    return min(max(score, 0), 10)
+
+
+def _breadth_state(score: float) -> str:
+    if score >= 8:
+        return "STRONG_RISK_ON"
+    if score >= 6.5:
+        return "RISK_ON"
+    if score >= 4.5:
+        return "NEUTRAL"
+    if score >= 3:
+        return "WEAK"
+    return "RISK_OFF"
+
+
+def _macro_explanation_he(
+    treasury_yields: Dict[str, Any],
+    oil: Dict[str, Any],
+    market_breadth: Dict[str, Any],
+) -> str:
+    parts: List[str] = []
+
+    ten_year_change = treasury_yields.get("10y", {}).get("change_5d_bps")
+    curve_state = treasury_yields.get("spreads", {}).get("curve_state")
+    if ten_year_change is None:
+        parts.append("נתוני התשואות חלקיים כרגע.")
+    elif ten_year_change > 5:
+        parts.append("התשואות עולות, וזה עשוי להכביד על מניות צמיחה.")
+    elif ten_year_change < -5:
+        parts.append("התשואות יורדות, וזה מקל מעט על נכסי סיכון.")
+    else:
+        parts.append("התשואות יציבות יחסית בימים האחרונים.")
+
+    if curve_state == "INVERTED_10Y_2Y":
+        parts.append("עקום 10Y-2Y עדיין הפוך.")
+    elif curve_state == "FLAT":
+        parts.append("עקום 10Y-2Y שטוח יחסית.")
+
+    oil_change = oil.get("brent", {}).get("change_5d_pct") or oil.get("wti", {}).get("change_5d_pct")
+    if oil_change is None:
+        parts.append("נתוני הנפט חלקיים.")
+    elif oil_change > 3:
+        parts.append("הנפט מתחזק, מה שעלול להוסיף לחץ אינפלציוני אם המהלך נמשך.")
+    elif oil_change < -3:
+        parts.append("הנפט נחלש, וזה מפחית לחץ אינפלציוני מצד האנרגיה.")
+
+    breadth_state = market_breadth.get("breadth_state")
+    if breadth_state in {"STRONG_RISK_ON", "RISK_ON"}:
+        parts.append("רוחב השוק חיובי והשתתפות העליות רחבה.")
+    elif breadth_state in {"WEAK", "RISK_OFF"}:
+        parts.append("רוחב השוק חלש ומאותת על זהירות.")
+    elif breadth_state == "NEUTRAL":
+        parts.append("רוחב השוק ניטרלי וללא יתרון ברור.")
+    else:
+        parts.append("אין מספיק נתונים אמינים לרוחב השוק.")
+
+    return " ".join(parts)
+
+
 def market_map() -> Dict[str, Any]:
+    treasury_yields = _treasury_yields()
+    oil = _oil_snapshot()
+    market_breadth = _market_breadth()
+    macro_data_status = {
+        "fred_ok": any(
+            treasury_yields.get(key, {}).get("value") is not None
+            for key in ("2y", "5y", "10y", "30y")
+        ) or oil.get("wti", {}).get("value") is not None or oil.get("brent", {}).get("value") is not None,
+        "breadth_ok": market_breadth.get("breadth_state") != "INSUFFICIENT_DATA",
+    }
+
     groups = {
         "core_market": CORE_MARKET,
         "macro": MACRO,
@@ -1074,4 +1450,9 @@ def market_map() -> Dict[str, Any]:
             "bearish": bearish_count,
         },
         "results": results,
+        "treasury_yields": treasury_yields,
+        "oil": oil,
+        "market_breadth": market_breadth,
+        "macro_explanation_he": _macro_explanation_he(treasury_yields, oil, market_breadth),
+        "macro_data_status": macro_data_status,
     }
